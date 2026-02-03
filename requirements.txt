@@ -1,0 +1,36 @@
+# AgriBot - Updated Requirements
+# Compatible with available PyTorch versions (2.2+)
+
+# Core Deep Learning
+torch>=2.2.0
+torchvision>=0.17.0
+torchaudio>=2.2.0
+
+# NLP & Embeddings
+sentence-transformers>=2.2.0
+nltk>=3.8
+
+# Machine Learning
+scikit-learn>=1.3.0
+
+# LLM Integration
+groq>=0.4.1
+
+# Image Processing & Computer Vision
+Pillow>=10.0.0
+opencv-python>=4.8.0
+timm>=0.9.0
+clip
+
+# Data Processing
+pandas>=2.0.0
+numpy>=1.24.0
+openpyxl>=3.1.0
+joblib>=1.3.0
+
+# Web Framework
+streamlit>=1.28.0
+
+# Environment & Utilities
+python-dotenv>=1.0.0
+requests>=2.31.0
