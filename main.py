@@ -2,45 +2,16 @@
 main.py — Streamlit Frontend cho Agricultural AI Chatbot.
 Giao diện sáng, hiện đại, chuyên nghiệp.
 
-=== FIXES so với bản gốc ===
-1. [CRITICAL] Image + Question Type: khi user có pending_image VÀ chọn
-   "Duyệt theo loại câu hỏi", system giờ:
-     a) Classify ảnh trước → lấy plant/disease
-     b) Gọi retrieve_by_question_type(qtype, plant) để filter đúng loại cây
-     c) Kết hợp với retrieve_by_disease(disease) cho context richer
-     d) Groq nhận context coherent: ảnh + question type + disease-specific Q&A
-
-2. [CRITICAL] retrieve_by_question_type() NEVER được gọi trong bản gốc.
-   Giờ được wire đúng vào process_query() khi qtype được detect.
-
-3. [BUG] Dead code sau "return card_html, response" → xóa hoàn toàn.
-
-4. [BUG] pending_image cleanup không consistent → fix thứ tự reset.
-
-5. [BUG] Quick questions không incorporate image context →
-   khi có pending_image, retrieval query được prepend với detected disease/plant.
-
-6. [DESIGN] Sidebar qt_map buttons giờ pass _pending_qtype (raw key)
-   thay vì embed vào text query → process_query có thể parse đúng loại câu hỏi.
-
-7. [FIX] st.session_state input clearing: dùng dynamic key bằng counter.
-8. [FIX] Enter key handling: on_change callback + flag.
-
-=== UPDATE mới ===
-9. [NGHIỆP VỤ] qtype → map thành mô tả nghiệp vụ nông nghiệp thực hành.
-   Groq không còn "giải thích loại câu hỏi trong dataset" mà trả lời đúng
-   theo vai trò tư vấn nông nghiệp tương ứng với từng qtype.
-
-10. [UI] Ảnh chẩn đoán được hiển thị rõ ràng trong phần tin nhắn:
-    - Bot bubble có section "📸 Ảnh bạn gửi" với thumbnail
-    - Diagnosis card hiển thị đầy đủ: plant, disease, confidence, qtype nghiệp vụ
-    - Cached image follow-up cũng hiển thị lại thumbnail + card
+=== UPDATES: PESTICIDE INTEGRATION ===
+- Thêm "💊 Gợi ý thuốc điều trị" tab trong sidebar
+- Sau khi chẩn đoán ảnh, tự động hiển thị card thuốc điều trị
+- Cho phép tìm kiếm thuốc theo tên hoạt chất
+- PesticideEngine được lazy-loaded như các engine khác
 """
 import os, sys, warnings, time, base64, io
 import streamlit as st
 from PIL import Image
 import pandas as pd
-
 
 warnings.filterwarnings("ignore")
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -50,10 +21,6 @@ from translation import detect_language, format_disease_info
 
 # ──────────────────────────────────────────
 # QTYPE → NGHIỆP VỤ MAPPING
-# Ánh xạ từ raw question_type key → mô tả nghiệp vụ nông nghiệp thực hành.
-# Được dùng để:
-#   1) Hướng Groq trả lời đúng góc độ tư vấn (không "giải thích dataset")
-#   2) Hiển thị chip nghiệp vụ trong diagnosis card
 # ──────────────────────────────────────────
 QTYPE_NGHIEP_VU = {
     "Existence & Sanity Check": {
@@ -186,17 +153,31 @@ QTYPE_NGHIEP_VU = {
             "Then provide an urgent treatment plan."
         ),
     },
+    "Treatment & Pesticide Recommendation": {
+        "vi": "Gợi ý thuốc & phác đồ điều trị",
+        "en": "Treatment & Pesticide Recommendation",
+        "instruction_vi": (
+            "Dựa trên kết quả chẩn đoán bệnh, đưa ra phác đồ điều trị đầy đủ. "
+            "Bao gồm: tên hoạt chất thuốc, tên sản phẩm thương mại cụ thể, "
+            "liều lượng pha chế, cách phun, thời điểm phun tốt nhất, và lưu ý an toàn. "
+            "Ưu tiên các sản phẩm từ cơ sở dữ liệu thuốc PPID đã được cung cấp."
+        ),
+        "instruction_en": (
+            "Based on the disease diagnosis, provide a complete treatment protocol. "
+            "Include: active ingredient names, specific commercial product names, "
+            "mixing rates, application method, optimal timing, and safety precautions. "
+            "Prioritize products from the PPID pesticide database provided."
+        ),
+    },
 }
 
 
 def get_qtype_label(qtype: str, lang: str) -> str:
-    """Lấy nhãn nghiệp vụ từ qtype key."""
     info = QTYPE_NGHIEP_VU.get(qtype, {})
     return info.get(lang, qtype)
 
 
 def get_qtype_instruction(qtype: str, lang: str) -> str:
-    """Lấy instruction hướng dẫn Groq từ qtype key."""
     info = QTYPE_NGHIEP_VU.get(qtype, {})
     key = f"instruction_{lang}"
     return info.get(key, f"Trả lời theo loại: {qtype}" if lang == "vi" else f"Answer regarding: {qtype}")
@@ -212,12 +193,12 @@ st.set_page_config(
     initial_sidebar_state="expanded",
     menu_items={
         "Get Help": "https://huggingface.co/datasets/SyedNazmusSakib/PlantVillageVQA",
-        "About": "AgriBot — AI Agricultural Chatbot | Powered by Groq + CLIP",
+        "About": "AgriBot — AI Agricultural Chatbot | Powered by Groq + CLIP + PPID",
     }
 )
 
 # ──────────────────────────────────────────
-# CSS
+# CSS (same as before + pesticide card styles)
 # ──────────────────────────────────────────
 st.markdown("""
 <style>
@@ -237,7 +218,6 @@ body, .stApp { font-family: 'DM Sans', sans-serif; background: #F4F8F4; color: v
 #MainMenu, footer, .stDeployButton { display: none !important; }
 .block-container { padding-top: 0 !important; max-width: 1100px !important; margin: 0 auto; }
 
-/* ─── HEADER ─── */
 .agri-header {
     background: linear-gradient(135deg, #1B5E20 0%, #2E7D32 50%, #388E3C 100%);
     padding: 18px 32px; display: flex; align-items: center; gap: 16px;
@@ -252,7 +232,6 @@ body, .stApp { font-family: 'DM Sans', sans-serif; background: #F4F8F4; color: v
     padding: 5px 14px; border-radius: 20px; font-size: 12px; font-weight: 600;
 }
 
-/* ─── SIDEBAR ─── */
 [data-testid="stSidebar"] { background: #fff; border-right: 1px solid #E0E0E0; }
 .sidebar-section-title {
     font-family: 'Playfair Display', serif; font-size: 15px; font-weight: 700;
@@ -260,10 +239,8 @@ body, .stApp { font-family: 'DM Sans', sans-serif; background: #F4F8F4; color: v
     margin-bottom: 10px; padding-bottom: 6px; border-bottom: 2px solid var(--green-pale);
 }
 
-/* ─── CHAT MESSAGES ─── */
 .chat-messages { padding: 20px 24px; }
 
-/* User bubble */
 .msg-user { display: flex; justify-content: flex-end; margin-bottom: 14px; gap: 10px; align-items: flex-end; }
 .msg-user .bubble {
     background: linear-gradient(135deg, #2E7D32, #4CAF50); color: #fff;
@@ -277,7 +254,6 @@ body, .stApp { font-family: 'DM Sans', sans-serif; background: #F4F8F4; color: v
     color: #fff; font-size: 14px; flex-shrink: 0;
 }
 
-/* Bot bubble */
 .msg-bot { display: flex; justify-content: flex-start; margin-bottom: 14px; gap: 10px; align-items: flex-start; }
 .msg-bot .avatar {
     width: 34px; height: 34px; border-radius: 50%;
@@ -294,7 +270,6 @@ body, .stApp { font-family: 'DM Sans', sans-serif; background: #F4F8F4; color: v
 }
 .msg-bot .bubble strong { color: var(--green-primary); }
 
-/* ─── INPUT ─── */
 .stTextInput input {
     border: 1.5px solid #DDD !important; border-radius: 24px !important;
     padding: 11px 20px !important; font-size: 14px !important;
@@ -304,7 +279,6 @@ body, .stApp { font-family: 'DM Sans', sans-serif; background: #F4F8F4; color: v
 .stTextInput input:focus { border-color: var(--green-primary) !important; box-shadow: 0 0 0 3px rgba(46,125,50,0.12) !important; }
 .stButton button { font-family: 'DM Sans', sans-serif; border-radius: 24px; font-weight: 600; font-size: 13px; }
 
-/* ─── DIAGNOSIS CARD ─── */
 .diagnosis-card {
     background: linear-gradient(135deg, #E8F5E9, #F1F8E9);
     border: 1px solid #C8E6C9; border-radius: 10px;
@@ -323,7 +297,26 @@ body, .stApp { font-family: 'DM Sans', sans-serif; background: #F4F8F4; color: v
     display: flex; flex-wrap: wrap; gap: 6px; align-items: center;
 }
 
-/* ─── CHIPS ─── */
+/* PESTICIDE CARD */
+.pesticide-card {
+    background: linear-gradient(135deg, #E3F2FD, #EDE7F6);
+    border: 1px solid #90CAF9; border-radius: 10px;
+    padding: 12px 14px; margin: 8px 0 12px 0;
+    box-shadow: 0 2px 6px rgba(33,150,243,0.10);
+}
+.pesticide-card .card-header {
+    font-size: 12px; font-weight: 600; color: #1565C0;
+    margin-bottom: 8px; display: flex; align-items: center; gap: 5px;
+}
+.pesticide-card .ingr-chip {
+    display: inline-block; background: #E3F2FD; color: #1565C0;
+    padding: 2px 8px; border-radius: 10px; font-size: 11px;
+    font-weight: 600; margin: 2px;
+}
+.pesticide-card .prod-row {
+    font-size: 12px; color: #4E4E4E; line-height: 1.6;
+}
+
 .chip {
     display: inline-flex; align-items: center; gap: 4px;
     padding: 4px 10px; border-radius: 14px;
@@ -334,60 +327,30 @@ body, .stApp { font-family: 'DM Sans', sans-serif; background: #F4F8F4; color: v
 .chip-healthy    { background: #E8F5E9; color: #2E7D32; }
 .chip-confidence { background: #EEF2FF; color: #3F51B5; }
 .chip-qtype      { background: #F3E5F5; color: #6A1B9A; }
+.chip-medicine   { background: #E3F2FD; color: #1565C0; }
 
-/* ─── IMAGE PREVIEW trong Bot Bubble ─── */
 .img-preview-wrapper {
-    background: #fff;
-    border: 1px solid #E0E0E0;
-    border-radius: 10px;
-    padding: 10px 12px;
-    margin: 0 0 10px 0;
-    display: flex;
-    gap: 12px;
-    align-items: flex-start;
+    background: #fff; border: 1px solid #E0E0E0;
+    border-radius: 10px; padding: 10px 12px; margin: 0 0 10px 0;
+    display: flex; gap: 12px; align-items: flex-start;
 }
 .img-preview-wrapper .img-thumb {
-    width: 90px;
-    height: 90px;
-    border-radius: 8px;
-    object-fit: cover;
-    border: 2px solid #C8E6C9;
-    flex-shrink: 0;
+    width: 90px; height: 90px; border-radius: 8px;
+    object-fit: cover; border: 2px solid #C8E6C9; flex-shrink: 0;
 }
-.img-preview-wrapper .img-info {
-    flex: 1;
-    font-size: 12px;
-    line-height: 1.6;
-}
+.img-preview-wrapper .img-info { flex: 1; font-size: 12px; line-height: 1.6; }
 .img-preview-wrapper .img-info .img-label {
-    font-size: 11px;
-    font-weight: 600;
-    color: var(--text-light);
-    text-transform: uppercase;
-    letter-spacing: 0.8px;
-    margin-bottom: 3px;
+    font-size: 11px; font-weight: 600; color: var(--text-light);
+    text-transform: uppercase; letter-spacing: 0.8px; margin-bottom: 3px;
 }
 .img-preview-wrapper .img-info .img-tag {
-    display: inline-block;
-    background: #E8F5E9;
-    color: #2E7D32;
-    padding: 2px 8px;
-    border-radius: 10px;
-    font-size: 11px;
-    font-weight: 600;
-    margin-right: 4px;
-    margin-bottom: 2px;
+    display: inline-block; background: #E8F5E9; color: #2E7D32;
+    padding: 2px 8px; border-radius: 10px; font-size: 11px;
+    font-weight: 600; margin-right: 4px; margin-bottom: 2px;
 }
-.img-preview-wrapper .img-info .img-tag.disease-tag {
-    background: #FFF3E0;
-    color: #E65100;
-}
-.img-preview-wrapper .img-info .img-tag.cached-tag {
-    background: #EEF2FF;
-    color: #3F51B5;
-}
+.img-preview-wrapper .img-info .img-tag.disease-tag { background: #FFF3E0; color: #E65100; }
+.img-preview-wrapper .img-info .img-tag.cached-tag  { background: #EEF2FF; color: #3F51B5; }
 
-/* ─── STATS ─── */
 .stats-row { display: flex; gap: 12px; margin-bottom: 8px; }
 .stat-card {
     flex: 1; background: #fff; border-radius: 10px; padding: 12px 14px;
@@ -396,7 +359,6 @@ body, .stApp { font-family: 'DM Sans', sans-serif; background: #F4F8F4; color: v
 .stat-card .stat-num { font-family: 'Playfair Display', serif; font-size: 20px; font-weight: 700; color: var(--green-primary); }
 .stat-card .stat-label { font-size: 11px; color: var(--text-light); margin-top: 2px; }
 
-/* ─── SCROLLBAR ─── */
 ::-webkit-scrollbar { width: 6px; }
 ::-webkit-scrollbar-track { background: transparent; }
 ::-webkit-scrollbar-thumb { background: #CCC; border-radius: 3px; }
@@ -413,7 +375,7 @@ body, .stApp { font-family: 'DM Sans', sans-serif; background: #F4F8F4; color: v
 
 
 # ══════════════════════════════════════════════════════
-# SESSION STATE INITIALIZATION
+# SESSION STATE
 # ══════════════════════════════════════════════════════
 defaults = {
     "messages":           [],
@@ -421,16 +383,16 @@ defaults = {
     "groq_client":        None,
     "retrieval_engine":   None,
     "image_classifier_fixed":   None,
+    "pesticide_engine":   None,   # NEW
     "df":                 None,
     "pending_image":      None,
     "input_counter":      0,
     "_input_submitted":   False,
     "_pending_qtype":     None,
-    # ── CONTINUITY: cache ảnh + classification across follow-up turns ──
-    "_cached_classifications": None,   # list[dict] từ ImageClassifier.classify()
-    "_cached_plant":           "",     # str — plant detect từ ảnh
-    "_cached_disease":         "",     # str — disease detect từ ảnh
-    "_cached_image_b64":       "",     # str — base64 thumbnail của ảnh đã classify (để reuse trong chat)
+    "_cached_classifications": None,
+    "_cached_plant":           "",
+    "_cached_disease":         "",
+    "_cached_image_b64":       "",
 }
 for k, v in defaults.items():
     if k not in st.session_state:
@@ -438,7 +400,7 @@ for k, v in defaults.items():
 
 
 # ══════════════════════════════════════════════════════
-# LAZY-LOAD HEAVY OBJECTS (cached)
+# LAZY-LOAD HEAVY OBJECTS
 # ══════════════════════════════════════════════════════
 @st.cache_resource(show_spinner="🌱 Đang khởi tạo hệ thống...")
 def load_dataset_cached():
@@ -460,16 +422,20 @@ def load_groq_client():
     from groq_client import GroqClient
     return GroqClient()
 
+@st.cache_resource(show_spinner="💊 Đang tải dữ liệu thuốc PPID...")
+def load_pesticide_engine():
+    from pesticide_engine import PesticideEngine
+    return PesticideEngine()
+
 
 # ══════════════════════════════════════════════════════
-# HELPER FUNCTIONS
+# HELPERS
 # ══════════════════════════════════════════════════════
 def get_lang():
     return st.session_state["lang"]
 
 
 def _pil_to_base64(img: Image.Image, max_size: int = 150) -> str:
-    """Chuyển PIL Image → base64 string (thumbnail nhỏ cho hiển thị trong chat)."""
     img_copy = img.copy()
     img_copy.thumbnail((max_size, max_size), Image.LANCZOS)
     buf = io.BytesIO()
@@ -484,6 +450,7 @@ def add_welcome_message():
             "👋 Chào mừng bạn đến với **AgriBot**!\n\n"
             "Tôi là trợ lý AI chuyên tư vấn nông nghiệp. Tôi có thể giúp bạn:\n\n"
             "🌱 **Chẩn đoán bệnh cây trồng** — Gửi ảnh lá cây hoặc mô tả triệu chứng\n"
+            "💊 **Gợi ý thuốc điều trị** — Từ cơ sở dữ liệu PPID (Canada Health)\n"
             "💬 **Trả lời câu hỏi nông nghiệp** — Về canh tác, phòng chữa bệnh, phân bón\n"
             "🔍 **Tra cứu thông tin** — Tìm giải pháp từ cơ sở dữ liệu PlantVillage\n\n"
             "Thử gửi ảnh hoặc đặt câu hỏi nhé! 😊"
@@ -493,61 +460,99 @@ def add_welcome_message():
             "👋 Welcome to **AgriBot**!\n\n"
             "I'm your AI agricultural advisor. I can help you with:\n\n"
             "🌱 **Plant Disease Diagnosis** — Upload a leaf image or describe symptoms\n"
+            "💊 **Pesticide Recommendations** — From the PPID database (Canada Health)\n"
             "💬 **Agriculture Q&A** — About farming, disease prevention, fertilizers\n"
             "🔍 **Knowledge Search** — Find solutions from the PlantVillage database\n\n"
             "Try uploading an image or asking a question! 😊"
         )
-    st.session_state["messages"].append({"role": "bot", "content": msg, "card_html": "", "img_preview_html": ""})
+    st.session_state["messages"].append({
+        "role": "bot", "content": msg,
+        "card_html": "", "img_preview_html": "", "pesticide_html": ""
+    })
 
 
 # ══════════════════════════════════════════════════════
-# BUILD IMAGE PREVIEW HTML (hiển thị trong bot bubble)
+# BUILD PESTICIDE CARD HTML
+# ══════════════════════════════════════════════════════
+def _build_pesticide_card_html(disease: str, plant: str, lang: str) -> str:
+    """Tạo card HTML hiển thị gợi ý thuốc ngắn gọn trong chat bubble."""
+    engine = st.session_state.get("pesticide_engine")
+    if not engine or "healthy" in disease.lower():
+        return ""
+
+    try:
+        rec = engine.get_treatment_recommendations(disease, plant, lang, top_products=4)
+        if rec["is_healthy"] or not rec["active_ingredients"]:
+            return ""
+
+        ingr_chips = " ".join(
+            f'<span class="ingr-chip">{ing}</span>'
+            for ing in rec["active_ingredients"][:5]
+        )
+
+        prods_html = ""
+        if rec["products"]:
+            rows = []
+            for p in rec["products"][:4]:
+                name = p.get("product_name", "N/A")
+                reg  = p.get("registration", "N/A")
+                ing  = p.get("active_ingredient", p.get("ingredient", ""))
+                rows.append(f"• <strong>{name}</strong> ({ing}) — Reg: {reg}")
+            prods_html = (
+                f'<div class="prod-row" style="margin-top:6px;">'
+                + "<br>".join(rows) +
+                "</div>"
+            )
+        else:
+            prods_html = (
+                '<div class="prod-row" style="margin-top:6px;color:#888;">'
+                + ("Đang sử dụng tư vấn chuyên gia — xem phản hồi bên dưới."
+                   if lang == "vi" else
+                   "Using expert advice — see response below.")
+                + "</div>"
+            )
+
+        header = "💊 Gợi ý thuốc điều trị (PPID)" if lang == "vi" else "💊 Treatment Recommendations (PPID)"
+
+        return (
+            f'<div class="pesticide-card">'
+            f'  <div class="card-header">🧪 {header}</div>'
+            f'  <div>{ingr_chips}</div>'
+            f'  {prods_html}'
+            f'</div>'
+        )
+    except Exception as e:
+        print(f"[UI] Pesticide card error: {e}")
+        return ""
+
+
+# ══════════════════════════════════════════════════════
+# BUILD IMAGE PREVIEW HTML
 # ══════════════════════════════════════════════════════
 def _build_image_preview_html(
-    img_b64: str,
-    plant: str,
-    disease: str,
-    confidence: float,
-    lang: str,
-    is_cached: bool = False,
-    qtype: str | None = None
+    img_b64: str, plant: str, disease: str, confidence: float,
+    lang: str, is_cached: bool = False, qtype: str | None = None
 ) -> str:
-    """
-    Tạo HTML section hiển thị ảnh + thông tin chẩn đoán
-    ngay trong phần tin nhắn bot (trên diagnosis card).
-    """
     if not img_b64:
         return ""
 
     is_healthy = "healthy" in disease.lower()
-
-    # ── Labels ──
     label_photo = "📸 Ảnh bạn gửi" if lang == "vi" else "📸 Your uploaded image"
     if is_cached:
         label_photo = "📸 Ảnh đã gửi trước đó" if lang == "vi" else "📸 Previously uploaded image"
 
-    # ── Tags ──
     plant_tag = f'<span class="img-tag">🌱 {plant}</span>'
-
     if is_healthy:
-        status_tag = (
-            '<span class="img-tag">✅ Khỏe mạnh</span>'
-            if lang == "vi" else
-            '<span class="img-tag">✅ Healthy</span>'
-        )
+        status_tag = '<span class="img-tag">✅ Khỏe mạnh</span>' if lang == "vi" else '<span class="img-tag">✅ Healthy</span>'
     else:
         status_tag = f'<span class="img-tag disease-tag">⚠️ {disease}</span>'
 
     conf_label = "chắc chắn" if lang == "vi" else "confident"
     conf_tag = f'<span class="img-tag" style="background:#EEF2FF;color:#3F51B5;">📊 {confidence:.1f}% {conf_label}</span>'
-
     cached_tag = ""
     if is_cached:
-        cached_tag = (
-            '<span class="img-tag cached-tag">🔄 Tiếp tục từ ảnh trước</span>'
-            if lang == "vi" else
-            '<span class="img-tag cached-tag">🔄 From previous image</span>'
-        )
+        cached_tag = ('<span class="img-tag cached-tag">🔄 Tiếp tục từ ảnh trước</span>'
+                      if lang == "vi" else '<span class="img-tag cached-tag">🔄 From previous image</span>')
 
     qtype_tag = ""
     if qtype:
@@ -559,15 +564,8 @@ def _build_image_preview_html(
         f'  <img class="img-thumb" src="data:image/png;base64,{img_b64}" alt="plant leaf" />'
         f'  <div class="img-info">'
         f'    <div class="img-label">{label_photo}</div>'
-        f'    <div>'
-        f'      {plant_tag}'
-        f'      {status_tag}'
-        f'      {conf_tag}'
-        f'    </div>'
-        f'    <div style="margin-top:4px;">'
-        f'      {cached_tag}'
-        f'      {qtype_tag}'
-        f'    </div>'
+        f'    <div>{plant_tag}{status_tag}{conf_tag}</div>'
+        f'    <div style="margin-top:4px;">{cached_tag}{qtype_tag}</div>'
         f'  </div>'
         f'</div>'
     )
@@ -576,53 +574,45 @@ def _build_image_preview_html(
 # ══════════════════════════════════════════════════════
 # BUILD DIAGNOSIS CARD
 # ══════════════════════════════════════════════════════
-def _build_diagnosis_card(classifications: list[dict], lang: str, qtype: str | None = None, is_cached: bool = False) -> str:
-    """
-    Tạo card HTML hiển thị kết quả chẩn đoán (phần chip summary).
-    - qtype: hiển thị chip nghiệp vụ (đã map thành mô tả thực hành)
-    - is_cached: nếu True → header hiển thị "Tiếp tục từ ảnh trước"
-    """
+def _build_diagnosis_card(
+    classifications: list[dict], lang: str,
+    qtype: str | None = None, is_cached: bool = False
+) -> str:
     if not classifications:
         return ""
-
     top        = classifications[0]
     is_healthy = "healthy" in top["disease"].lower()
     card_cls   = "diagnosis-card" if is_healthy else "diagnosis-card warning"
-    plant      = top["plant"]
-    disease    = top["disease"]
-    conf       = top["confidence"]
+    plant, disease, conf = top["plant"], top["disease"], top["confidence"]
 
-    # ── Chips ──
     plant_chip = f'<span class="chip chip-plant">🌱 {plant}</span>'
-
     if is_healthy:
-        status_chip = (
-            '<span class="chip chip-healthy">✅ Khỏe mạnh</span>'
-            if lang == "vi" else
-            '<span class="chip chip-healthy">✅ Healthy</span>'
-        )
+        status_chip = ('<span class="chip chip-healthy">✅ Khỏe mạnh</span>'
+                       if lang == "vi" else '<span class="chip chip-healthy">✅ Healthy</span>')
     else:
         status_chip = f'<span class="chip chip-disease">⚠️ {disease}</span>'
 
-    conf_label  = "chắc chắn" if lang == "vi" else "confident"
-    conf_chip   = f'<span class="chip chip-confidence">📊 {conf:.1f}% {conf_label}</span>'
+    conf_label = "chắc chắn" if lang == "vi" else "confident"
+    conf_chip  = f'<span class="chip chip-confidence">📊 {conf:.1f}% {conf_label}</span>'
 
-    # ── Question Type chip → dùng nghiệp vụ thực hành ──
     qtype_chip = ""
     if qtype:
         qtype_label = get_qtype_label(qtype, lang)
         qtype_chip = f'<span class="chip chip-qtype">📂 {qtype_label}</span>'
 
-    # ── Header ──
-    if is_cached:
-        header = "🔬 Tiếp tục phân tích ảnh trước" if lang == "vi" else "🔬 Continuing previous image analysis"
-    else:
-        header = "🔬 Kết quả chẩn đoán" if lang == "vi" else "🔬 Diagnosis Result"
+    # Medicine chip for diseases
+    med_chip = ""
+    if not is_healthy:
+        med_chip = ('<span class="chip chip-medicine">💊 Xem gợi ý thuốc bên dưới</span>'
+                    if lang == "vi" else '<span class="chip chip-medicine">💊 See drug recommendations below</span>')
+
+    header = ("🔬 Tiếp tục phân tích ảnh trước" if is_cached else "🔬 Kết quả chẩn đoán") if lang == "vi" \
+             else ("🔬 Continuing previous image analysis" if is_cached else "🔬 Diagnosis Result")
 
     return (
         f'<div class="{card_cls}">'
         f'  <div class="card-header">{header}</div>'
-        f'  <div class="chip-row">{plant_chip} {status_chip} {conf_chip} {qtype_chip}</div>'
+        f'  <div class="chip-row">{plant_chip} {status_chip} {conf_chip} {qtype_chip} {med_chip}</div>'
         f'</div>'
     )
 
@@ -631,15 +621,7 @@ def _build_diagnosis_card(classifications: list[dict], lang: str, qtype: str | N
 # MAIN PROCESSING LOGIC
 # ══════════════════════════════════════════════════════
 def process_query(user_input: str, uploaded_image=None, qtype: str | None = None):
-    """
-    Trả về (card_html, img_preview_html, response_text).
-
-    Logic:
-        CASE A: có ảnh + có qtype → classify → retrieve by qtype+plant + by disease → Groq (nghiệp vụ)
-        CASE B: có ảnh + không có qtype → classify → retrieve enriched → Groq
-        CASE C: không có ảnh + có qtype → retrieve by qtype → Groq (nghiệp vụ, không có ảnh)
-        CASE D: không có ảnh + không có qtype → retrieve → Groq (normal chat)
-    """
+    """Returns (card_html, img_preview_html, pesticide_html, response_text)."""
     lang = get_lang()
     detected = detect_language(user_input)
     if len(user_input.strip()) > 5:
@@ -650,31 +632,25 @@ def process_query(user_input: str, uploaded_image=None, qtype: str | None = None
     classifier = st.session_state.get("image_classifier_fixed")
     groq       = st.session_state.get("groq_client")
 
-    # ─────────────────────────────────────
-    # Step 1: Classify image — với continuity logic
-    # ─────────────────────────────────────
+    # ─── Step 1: Classify image ───────────────────────────────────────────
     image_classifications = []
     detected_plant   = ""
     detected_disease = ""
-    current_img_b64  = ""   # base64 của ảnh hiện tại (mới hoặc cached)
+    current_img_b64  = ""
 
     if uploaded_image is not None and classifier:
-        # Case (a): ảnh mới → classify + save vào cache
         with st.spinner("🖼️ Đang phân loại ảnh..." if lang == "vi" else "🖼️ Classifying image..."):
             image_classifications = classifier.classify(uploaded_image, top_k=3)
             if image_classifications:
                 detected_plant   = image_classifications[0].get("plant", "")
                 detected_disease = image_classifications[0].get("disease", "")
-                # ── Save vào cache ──
                 st.session_state["_cached_classifications"] = image_classifications
                 st.session_state["_cached_plant"]           = detected_plant
                 st.session_state["_cached_disease"]         = detected_disease
-                # ── Save thumbnail base64 ──
                 current_img_b64 = _pil_to_base64(uploaded_image)
-                st.session_state["_cached_image_b64"]       = current_img_b64
+                st.session_state["_cached_image_b64"] = current_img_b64
 
     elif uploaded_image is None and qtype is not None:
-        # Case (b): không có ảnh mới, nhưng chọn question type → reuse cache
         cached = st.session_state.get("_cached_classifications")
         if cached:
             image_classifications = cached
@@ -682,169 +658,105 @@ def process_query(user_input: str, uploaded_image=None, qtype: str | None = None
             detected_disease = st.session_state.get("_cached_disease", "")
             current_img_b64  = st.session_state.get("_cached_image_b64", "")
 
-    # ─────────────────────────────────────
-    # Step 2: Retrieval — branch by case
-    # ─────────────────────────────────────
+    # ─── Step 2: Retrieval ────────────────────────────────────────────────
     retrieval_results = []
-
     if engine:
-        # ── CASE A: ảnh + qtype ──
         if image_classifications and qtype:
-            with st.spinner(
-                "🔍 Tìm kiếm thông tin liên quan..."
-                if lang == "vi" else
-                "🔍 Searching relevant information..."
-            ):
-                qtype_results = engine.retrieve_by_question_type(
-                    qtype=qtype, plant=detected_plant, top_k=3
-                )
+            with st.spinner("🔍 Tìm kiếm thông tin..." if lang == "vi" else "🔍 Searching..."):
+                qtype_results = engine.retrieve_by_question_type(qtype=qtype, plant=detected_plant, top_k=3)
                 retrieval_results.extend(qtype_results)
-
                 disease_results = engine.retrieve_by_disease(detected_disease, top_k=2)
                 seen = {r["Question"] for r in retrieval_results}
-                retrieval_results.extend(
-                    r for r in disease_results if r["Question"] not in seen
-                )
-
-                # Fallback nếu không match plant
+                retrieval_results.extend(r for r in disease_results if r["Question"] not in seen)
                 if not qtype_results:
-                    fallback = engine.retrieve_by_question_type(
-                        qtype=qtype, plant="", top_k=3
-                    )
+                    fallback = engine.retrieve_by_question_type(qtype=qtype, plant="", top_k=3)
                     seen = {r["Question"] for r in retrieval_results}
-                    retrieval_results.extend(
-                        r for r in fallback if r["Question"] not in seen
-                    )
+                    retrieval_results.extend(r for r in fallback if r["Question"] not in seen)
 
-        # ── CASE B: ảnh + không có qtype ──
         elif image_classifications and not qtype:
-            with st.spinner("🔍 Tìm kiếm thông tin..." if lang == "vi" else "🔍 Searching..."):
+            with st.spinner("🔍 Tìm kiếm..." if lang == "vi" else "🔍 Searching..."):
                 enriched_query = f"{detected_disease} {detected_plant} {user_input}"
                 retrieval_results = engine.retrieve(enriched_query, top_k=3)
-
                 extra = engine.retrieve_by_disease(detected_disease, top_k=2)
-                seen  = {r["Question"] for r in retrieval_results}
+                seen = {r["Question"] for r in retrieval_results}
                 retrieval_results.extend(r for r in extra if r["Question"] not in seen)
 
-        # ── CASE C: không có ảnh + có qtype ──
         elif not image_classifications and qtype:
-            with st.spinner(
-                "🔍 Tìm kiếm thông tin liên quan..."
-                if lang == "vi" else
-                "🔍 Searching relevant information..."
-            ):
-                retrieval_results = engine.retrieve_by_question_type(
-                    qtype=qtype, plant="", top_k=5
-                )
+            with st.spinner("🔍 Tìm kiếm..." if lang == "vi" else "🔍 Searching..."):
+                retrieval_results = engine.retrieve_by_question_type(qtype=qtype, plant="", top_k=5)
                 if len(retrieval_results) < 3:
                     general = engine.retrieve(user_input, top_k=3)
                     seen = {r["Question"] for r in retrieval_results}
-                    retrieval_results.extend(
-                        r for r in general if r["Question"] not in seen
-                    )
-
-        # ── CASE D: normal chat ──
+                    retrieval_results.extend(r for r in general if r["Question"] not in seen)
         else:
-            with st.spinner("🔍 Tìm kiếm thông tin..." if lang == "vi" else "🔍 Searching..."):
+            with st.spinner("🔍 Tìm kiếm..." if lang == "vi" else "🔍 Searching..."):
                 retrieval_results = engine.retrieve(user_input, top_k=3)
 
-    # ─────────────────────────────────────
-    # Step 3: Build user_message cho Groq
-    # ─────────────────────────────────────
-    is_cached_followup = (uploaded_image is None and image_classifications)
-
-    groq_user_message = user_input
+    # ─── Step 3: Build Groq message ───────────────────────────────────────
+    is_cached_followup = (uploaded_image is None and bool(image_classifications))
+    groq_user_message  = user_input
 
     if image_classifications and qtype:
-        # ── Lấy instruction nghiệp vụ từ mapping ──
         nghiep_vu_instruction = get_qtype_instruction(qtype, lang)
         nghiep_vu_label       = get_qtype_label(qtype, lang)
-
-        # ── Context note: mới hay cached ──
+        context_note = ""
         if is_cached_followup:
-            if lang == "vi":
-                context_note = (
-                    f"(Tiếp tục phân tích ảnh đã gửi trước đó.)\n"
-                    f"Ảnh đó đã được phân loại là: cây {detected_plant}, "
-                    f"{'khỏe mạnh' if 'healthy' in detected_disease.lower() else 'bệnh ' + detected_disease}.\n\n"
-                )
-            else:
-                context_note = (
-                    f"(Continuing analysis from previously uploaded image.)\n"
-                    f"That image was classified as: {detected_plant}, "
-                    f"{'healthy' if 'healthy' in detected_disease.lower() else detected_disease}.\n\n"
-                )
+            context_note = (
+                f"(Tiếp tục phân tích ảnh đã gửi trước đó.)\n"
+                f"Ảnh đó đã được phân loại: cây {detected_plant}, "
+                f"{'khỏe mạnh' if 'healthy' in detected_disease.lower() else 'bệnh ' + detected_disease}.\n\n"
+            ) if lang == "vi" else (
+                f"(Continuing analysis from previously uploaded image.)\n"
+                f"That image was classified as: {detected_plant}, "
+                f"{'healthy' if 'healthy' in detected_disease.lower() else detected_disease}.\n\n"
+            )
         else:
-            if lang == "vi":
-                context_note = (
-                    f"Ảnh đính kèm đã được phân loại là: cây {detected_plant}, "
-                    f"{'khỏe mạnh' if 'healthy' in detected_disease.lower() else 'bệnh ' + detected_disease}.\n\n"
-                )
-            else:
-                context_note = (
-                    f"The uploaded image is classified as: {detected_plant}, "
-                    f"{'healthy' if 'healthy' in detected_disease.lower() else detected_disease}.\n\n"
-                )
+            context_note = (
+                f"Ảnh đính kèm đã được phân loại: cây {detected_plant}, "
+                f"{'khỏe mạnh' if 'healthy' in detected_disease.lower() else 'bệnh ' + detected_disease}.\n\n"
+            ) if lang == "vi" else (
+                f"The uploaded image is classified as: {detected_plant}, "
+                f"{'healthy' if 'healthy' in detected_disease.lower() else detected_disease}.\n\n"
+            )
 
-        # ── Body: hướng dẫn Groq theo nghiệp vụ thực hành ──
         if lang == "vi":
             groq_user_message = (
                 context_note +
                 f"Bạn đang thực hiện nhiệm vụ: **{nghiep_vu_label}**.\n\n"
-                f"Yêu cầu cụ thể:\n"
-                f"{nghiep_vu_instruction}\n\n"
+                f"Yêu cầu cụ thể:\n{nghiep_vu_instruction}\n\n"
                 f"Cây trồng: {detected_plant}\n"
                 f"Trạng thái: {'Khỏe mạnh' if 'healthy' in detected_disease.lower() else 'Bệnh: ' + detected_disease}\n\n"
-                f"Dựa trên thông tin tra cứu đã được cung cấp và kết quả chẩn đoán ảnh, "
-                f"hãy trả lời theo đúng yêu cầu trên. "
-                f"Đưa ra lời khuyên thực hành cụ thể cho nông dân.\n\n"
-                f"Câu hỏi gốc: {user_input}"
+                f"Dựa trên thông tin tra cứu và kết quả chẩn đoán ảnh, hãy trả lời theo đúng yêu cầu. "
+                f"Đưa ra lời khuyên thực hành cụ thể cho nông dân.\n\nCâu hỏi gốc: {user_input}"
             )
         else:
             groq_user_message = (
                 context_note +
                 f"You are performing the task: **{nghiep_vu_label}**.\n\n"
-                f"Specific requirement:\n"
-                f"{nghiep_vu_instruction}\n\n"
+                f"Specific requirement:\n{nghiep_vu_instruction}\n\n"
                 f"Plant: {detected_plant}\n"
                 f"Status: {'Healthy' if 'healthy' in detected_disease.lower() else 'Disease: ' + detected_disease}\n\n"
-                f"Based on the reference information provided and the image diagnosis result, "
-                f"answer according to the above requirement. "
-                f"Provide specific practical advice for farmers.\n\n"
-                f"Original question: {user_input}"
+                f"Based on the reference info and image diagnosis, answer as specified. "
+                f"Provide practical advice for farmers.\n\nOriginal question: {user_input}"
             )
 
     elif not image_classifications and qtype:
-        # ── CASE C: không có ảnh nhưng có qtype → nghiệp vụ không gắn ảnh ──
         nghiep_vu_instruction = get_qtype_instruction(qtype, lang)
         nghiep_vu_label       = get_qtype_label(qtype, lang)
-
         if lang == "vi":
             groq_user_message = (
-                f"Nhiệm vụ: **{nghiep_vu_label}**\n\n"
-                f"Yêu cầu:\n"
-                f"{nghiep_vu_instruction}\n\n"
-                f"Dựa trên các ví dụ từ cơ sở dữ liệu đã được cung cấp, "
-                f"hãy trả lời theo đúng yêu cầu trên. "
-                f"Lấy các thông tin từ ví dụ tra cứu và tổng hợp thành lời khuyên thực hành cho nông dân. "
-                f"Không cần giải thích loại câu hỏi, chỉ cần trả lời theo nghiệp vụ.\n\n"
-                f"Yêu cầu gốc: {user_input}"
+                f"Nhiệm vụ: **{nghiep_vu_label}**\n\nYêu cầu:\n{nghiep_vu_instruction}\n\n"
+                f"Dựa trên các ví dụ từ cơ sở dữ liệu, hãy trả lời theo yêu cầu. "
+                f"Không cần giải thích loại câu hỏi, chỉ cần trả lời theo nghiệp vụ.\n\nYêu cầu gốc: {user_input}"
             )
         else:
             groq_user_message = (
-                f"Task: **{nghiep_vu_label}**\n\n"
-                f"Requirement:\n"
-                f"{nghiep_vu_instruction}\n\n"
-                f"Based on the examples from the knowledge base provided, "
-                f"answer according to the above requirement. "
-                f"Extract information from the retrieved examples and synthesize into practical advice for farmers. "
-                f"Do not explain the question type, just answer according to the task.\n\n"
-                f"Original request: {user_input}"
+                f"Task: **{nghiep_vu_label}**\n\nRequirement:\n{nghiep_vu_instruction}\n\n"
+                f"Based on the knowledge base examples, answer accordingly. "
+                f"Do not explain the question type, just answer the task.\n\nOriginal: {user_input}"
             )
 
-    # ─────────────────────────────────────
-    # Step 4: Call Groq
-    # ─────────────────────────────────────
+    # ─── Step 4: Call Groq ────────────────────────────────────────────────
     response = ""
     if groq:
         history = [
@@ -862,30 +774,25 @@ def process_query(user_input: str, uploaded_image=None, qtype: str | None = None
     else:
         response = "⚠️ Groq client chưa được khởi tạo. Kiểm tra GROQ_API_KEY."
 
-    # ─────────────────────────────────────
-    # Step 5: Build diagnosis card + image preview
-    # ─────────────────────────────────────
+    # ─── Step 5: Build cards ──────────────────────────────────────────────
     card_html = _build_diagnosis_card(
-        image_classifications, lang,
-        qtype=qtype,
-        is_cached=is_cached_followup
+        image_classifications, lang, qtype=qtype, is_cached=is_cached_followup
     )
 
-    # ── Build image preview HTML ──
     img_preview_html = ""
     if image_classifications and current_img_b64:
         top = image_classifications[0]
         img_preview_html = _build_image_preview_html(
-            img_b64=current_img_b64,
-            plant=top["plant"],
-            disease=top["disease"],
-            confidence=top["confidence"],
-            lang=lang,
-            is_cached=is_cached_followup,
-            qtype=qtype
+            img_b64=current_img_b64, plant=top["plant"], disease=top["disease"],
+            confidence=top["confidence"], lang=lang, is_cached=is_cached_followup, qtype=qtype
         )
 
-    return card_html, img_preview_html, response
+    # Pesticide card HTML
+    pesticide_html = ""
+    if image_classifications and detected_disease and "healthy" not in detected_disease.lower():
+        pesticide_html = _build_pesticide_card_html(detected_disease, detected_plant, lang)
+
+    return card_html, img_preview_html, pesticide_html, response
 
 
 # ══════════════════════════════════════════════════════
@@ -919,6 +826,13 @@ def main():
     elif not GROQ_API_KEY:
         st.sidebar.error("⚠️ GROQ_API_KEY chưa đặt.")
 
+    # ── Load Pesticide Engine ──
+    if st.session_state["pesticide_engine"] is None:
+        try:
+            st.session_state["pesticide_engine"] = load_pesticide_engine()
+        except Exception as e:
+            st.sidebar.warning(f"⚠️ Pesticide Engine: {e}")
+
     if not st.session_state["messages"]:
         add_welcome_message()
 
@@ -930,9 +844,9 @@ def main():
             <div class="logo-icon">🌿</div>
             <div class="header-text">
                 <h1>AgriBot</h1>
-                <p>Trợ lý AI Nông Nghiệp — Plant Disease Diagnosis & Advisory</p>
+                <p>Trợ lý AI Nông Nghiệp — Plant Disease Diagnosis & Advisory | 💊 PPID Pesticide Database</p>
             </div>
-            <div class="header-badge">🤖 Powered by Groq + CLIP</div>
+            <div class="header-badge">🤖 Groq + CLIP + PPID</div>
         </div>
     ''', unsafe_allow_html=True)
 
@@ -942,7 +856,7 @@ def main():
     with st.sidebar:
         lang = get_lang()
 
-        # ── Language ──
+        # Language
         st.markdown('<div class="sidebar-section-title">🌐 Ngôn Ngữ / Language</div>', unsafe_allow_html=True)
         c1, c2 = st.columns(2)
         with c1:
@@ -955,28 +869,85 @@ def main():
                 st.session_state["lang"] = "en"; st.rerun()
         st.divider()
 
-        # ── Stats ──
-        ds  = len(df) if df is not None else 0
-        nd  = df["Disease"].nunique() if (df is not None and "Disease" in df.columns) else 0
-        nq  = df["question_type"].nunique() if (df is not None and "question_type" in df.columns) else 0
+        # Stats
+        ds = len(df) if df is not None else 0
+        nd = df["Disease"].nunique() if (df is not None and "Disease" in df.columns) else 0
+        nq = df["question_type"].nunique() if (df is not None and "question_type" in df.columns) else 0
+        pe = st.session_state.get("pesticide_engine")
+        np_prods = pe.get_stats()["n_products"] if pe else 0
+
         st.markdown(f'''
             <div class="stats-row">
-                <div class="stat-card"><div class="stat-num">{ds:,}</div><div class="stat-label">{"Mục dữ liệu" if lang=="vi" else "Data Items"}</div></div>
+                <div class="stat-card"><div class="stat-num">{ds:,}</div><div class="stat-label">{"Mục QA" if lang=="vi" else "QA Items"}</div></div>
                 <div class="stat-card"><div class="stat-num">{nd}</div><div class="stat-label">{"Loại bệnh" if lang=="vi" else "Diseases"}</div></div>
-                <div class="stat-card"><div class="stat-num">{nq}</div><div class="stat-label">{"Loại phân tích" if lang=="vi" else "Analysis Types"}</div></div>
+                <div class="stat-card"><div class="stat-num">{np_prods:,}</div><div class="stat-label">{"Sp thuốc" if lang=="vi" else "Products"}</div></div>
             </div>
         ''', unsafe_allow_html=True)
         st.divider()
 
-        # ── Quick Questions ──
-        st.markdown(f'<div class="sidebar-section-title">⚡ {"Câu hỏi nhanh" if lang=="vi" else "Quick Questions"}</div>', unsafe_allow_html=True)
+        # Pesticide Search
+        st.markdown(
+            f'<div class="sidebar-section-title">💊 {"Tìm thuốc theo hoạt chất" if lang=="vi" else "Search by Ingredient"}</div>',
+            unsafe_allow_html=True
+        )
+        ingr_search = st.text_input(
+            "Ingredient",
+            placeholder="azoxystrobin, copper, mancozeb..." if lang == "en" else "azoxystrobin, copper, mancozeb...",
+            label_visibility="collapsed",
+            key="ingr_search_input"
+        )
+        if st.button("🔍 Tìm" if lang == "vi" else "🔍 Search",
+                     use_container_width=True, type="secondary", key="btn_ingr_search"):
+            if ingr_search.strip() and pe:
+                results = pe.search_by_ingredient(ingr_search.strip(), top_k=8)
+                if results:
+                    # Build clean HTML table
+                    rows_html = ""
+                    for r in results:
+                        pname = r['product_name']
+                        ingr  = r['active_ingredient']
+                        reg   = r['registration']
+                        ptype = r.get('product_type', '')
+                        type_badge = f'<span style="background:#E8F5E9;color:#2E7D32;padding:1px 6px;border-radius:8px;font-size:10px;">{ptype}</span>' if ptype else ''
+                        rows_html += f"""
+                        <div style="border-bottom:1px solid #EEE;padding:8px 0;">
+                            <div style="font-weight:600;font-size:13px;color:#1B1B1B;">💊 {pname}</div>
+                            <div style="font-size:11px;color:#555;margin-top:2px;">
+                                🧪 <em>{ingr}</em> &nbsp;|&nbsp; 📋 Reg: {reg}
+                                {'&nbsp;' + type_badge if type_badge else ''}
+                            </div>
+                        </div>"""
+                    st.markdown(
+                        f'<div style="background:#F0F7F0;border:1px solid #C8E6C9;border-radius:10px;padding:10px 14px;max-height:320px;overflow-y:auto;">'
+                        f'<div style="font-size:11px;font-weight:700;color:#2E7D32;margin-bottom:6px;">'
+                        f'✅ {"Tìm thấy" if lang=="vi" else "Found"} {len(results)} {"sản phẩm nông nghiệp" if lang=="vi" else "agricultural products"}</div>'
+                        f'{rows_html}</div>',
+                        unsafe_allow_html=True
+                    )
+                else:
+                    st.warning(
+                        f"Không tìm thấy sản phẩm nông nghiệp chứa '{ingr_search}'.\n"
+                        f"Thử: azoxystrobin, mancozeb, copper, chlorothalonil..."
+                        if lang == "vi" else
+                        f"No agricultural products found for '{ingr_search}'.\n"
+                        f"Try: azoxystrobin, mancozeb, copper, chlorothalonil..."
+                    )
+            elif not pe:
+                st.warning("Pesticide engine chưa sẵn sàng." if lang == "vi" else "Pesticide engine not ready.")
+        st.divider()
+
+        # Quick Questions
+        st.markdown(
+            f'<div class="sidebar-section-title">⚡ {"Câu hỏi nhanh" if lang=="vi" else "Quick Questions"}</div>',
+            unsafe_allow_html=True
+        )
         qs_vi = [
             "🍅 Bệnh cà chua thường gặp là gì?",
             "🍎 Cách chữa bệnh ghẻ táo?",
             "🌽 Bệnh héo lá ngô là do gì?",
             "🥔 Phòng bệnh khoai tây như thế nào?",
             "🍇 Các loại bệnh nho phổ biến?",
-            "🌿 Cách sử dụng phân bón hữu cơ?",
+            "💊 Thuốc nào chữa bệnh phấn trắng?",
         ]
         qs_en = [
             "🍅 What are common tomato diseases?",
@@ -984,7 +955,7 @@ def main():
             "🌽 What causes corn leaf blight?",
             "🥔 How to prevent potato diseases?",
             "🍇 Common grape diseases?",
-            "🌿 How to use organic fertilizer?",
+            "💊 What pesticide treats powdery mildew?",
         ]
         for i, q in enumerate(qs_vi if lang == "vi" else qs_en):
             if st.button(q, use_container_width=True, type="secondary", key=f"quick_{i}"):
@@ -993,81 +964,61 @@ def main():
                 st.rerun()
         st.divider()
 
-        # ── Question Type (Duyệt theo loại phân tích) ──
+        # Question Type
         qt_title = "📂 Chọn loại phân tích" if lang == "vi" else "📂 Select Analysis Type"
         with st.expander(qt_title, expanded=False):
             qt_map = {
-                "Existence & Sanity Check":        ("🟢 Xác nhận cây trong ảnh",     "🟢 Confirm Plant"),
-                "Plant Species Identification":    ("🌱 Xác định loại cây",           "🌱 Identify Species"),
-                "General Health Assessment":       ("❤️ Đánh giá sức khỏe cây",      "❤️ Health Assessment"),
-                "Visual Attribute Grounding":      ("👁️ Nhận dạng triệu chứng",      "👁️ Identify Symptoms"),
-                "Detailed Verification":           ("🔎 Xác minh chi tiết bệnh",      "🔎 Verify Details"),
-                "Specific Disease Identification": ("🏥 Xác định tên bệnh",           "🏥 Identify Disease"),
-                "Comprehensive Description":       ("📝 Mô tả toàn diện bệnh",        "📝 Full Description"),
-                "Causal Reasoning":                ("🔗 Phân tích nguyên nhân bệnh",  "🔗 Analyze Cause"),
-                "Counterfactual Reasoning":        ("💡 Dự đoán nếu không điều trị",  "💡 Predict Without Treatment"),
+                "Existence & Sanity Check":          ("🟢 Xác nhận cây trong ảnh",     "🟢 Confirm Plant"),
+                "Plant Species Identification":      ("🌱 Xác định loại cây",           "🌱 Identify Species"),
+                "General Health Assessment":         ("❤️ Đánh giá sức khỏe cây",      "❤️ Health Assessment"),
+                "Visual Attribute Grounding":        ("👁️ Nhận dạng triệu chứng",      "👁️ Identify Symptoms"),
+                "Detailed Verification":             ("🔎 Xác minh chi tiết bệnh",      "🔎 Verify Details"),
+                "Specific Disease Identification":   ("🏥 Xác định tên bệnh",           "🏥 Identify Disease"),
+                "Comprehensive Description":         ("📝 Mô tả toàn diện bệnh",        "📝 Full Description"),
+                "Causal Reasoning":                  ("🔗 Phân tích nguyên nhân bệnh",  "🔗 Analyze Cause"),
+                "Counterfactual Reasoning":          ("💡 Dự đoán nếu không điều trị",  "💡 Predict Without Treatment"),
+                "Treatment & Pesticide Recommendation": ("💊 Gợi ý thuốc điều trị",    "💊 Recommend Treatment"),
             }
 
-            # ── Detect image context ──
             has_pending = st.session_state.get("pending_image") is not None
             has_cached  = st.session_state.get("_cached_classifications") is not None
             has_any_image_context = has_pending or has_cached
 
-            # ── Banner thông báo ──
             if has_pending:
-                st.info(
-                    "📌 Bạn đang có ảnh chờ phân tích.\n"
-                    "Chọn loại phân tích bên dưới để bắt đầu."
-                    if lang == "vi" else
-                    "📌 You have a pending image.\n"
-                    "Select an analysis type below to start."
-                )
+                st.info("📌 Bạn đang có ảnh chờ phân tích." if lang == "vi" else "📌 You have a pending image.")
             elif has_cached:
                 cached_plant   = st.session_state.get("_cached_plant", "")
                 cached_disease = st.session_state.get("_cached_disease", "")
                 st.info(
                     f"🔄 Đang tiếp tục với ảnh: **{cached_plant}** — "
-                    f"{'Khỏe mạnh' if 'healthy' in cached_disease.lower() else cached_disease}.\n"
-                    f"Chọn loại phân tích khác để tiếp tục."
+                    f"{'Khỏe mạnh' if 'healthy' in cached_disease.lower() else cached_disease}."
                     if lang == "vi" else
                     f"🔄 Continuing with image: **{cached_plant}** — "
-                    f"{'Healthy' if 'healthy' in cached_disease.lower() else cached_disease}.\n"
-                    f"Select another analysis type to continue."
+                    f"{'Healthy' if 'healthy' in cached_disease.lower() else cached_disease}."
                 )
             else:
                 st.caption(
-                    "💡 Gửi ảnh lá cây trước, sau đó chọn loại phân tích để tìm hiểu sâu hơn."
-                    if lang == "vi" else
-                    "💡 Upload a leaf image first, then select an analysis type for deeper insights."
+                    "💡 Gửi ảnh lá cây trước để phân tích chuyên sâu."
+                    if lang == "vi" else "💡 Upload a leaf image first for in-depth analysis."
                 )
 
             for raw, (vi_l, en_l) in qt_map.items():
                 if st.button(vi_l if lang == "vi" else en_l,
                              use_container_width=True, type="secondary", key=f"qt_{raw}"):
                     st.session_state["_pending_qtype"] = raw
-
-                    # Build user message
-                    if has_any_image_context:
-                        nghiep_vu = get_qtype_label(raw, lang)
-                        if lang == "vi":
-                            q = f"Phân tích ảnh theo: {nghiep_vu}"
-                        else:
-                            q = f"Analyze image for: {nghiep_vu}"
-                    else:
-                        nghiep_vu = get_qtype_label(raw, lang)
-                        if lang == "vi":
-                            q = f"Cho tôi thông tin về: {nghiep_vu}"
-                        else:
-                            q = f"Tell me about: {nghiep_vu}"
-
+                    nghiep_vu = get_qtype_label(raw, lang)
+                    q = (f"Phân tích ảnh theo: {nghiep_vu}" if lang == "vi" else f"Analyze image for: {nghiep_vu}") \
+                        if has_any_image_context else \
+                        (f"Cho tôi thông tin về: {nghiep_vu}" if lang == "vi" else f"Tell me about: {nghiep_vu}")
                     st.session_state["_quick_q"] = q
                     st.rerun()
         st.divider()
 
-        # ── Image Upload ──
-        st.markdown(f'<div class="sidebar-section-title">🖼️ {"Gửi Ảnh Bệnh Lá" if lang=="vi" else "Upload Leaf Image"}</div>', unsafe_allow_html=True)
-
-        # ── Show cached image status + reset button ──
+        # Image Upload
+        st.markdown(
+            f'<div class="sidebar-section-title">🖼️ {"Gửi Ảnh Bệnh Lá" if lang=="vi" else "Upload Leaf Image"}</div>',
+            unsafe_allow_html=True
+        )
         if st.session_state.get("_cached_classifications") and not st.session_state.get("pending_image"):
             cached_plant   = st.session_state.get("_cached_plant", "")
             cached_disease = st.session_state.get("_cached_disease", "")
@@ -1081,9 +1032,9 @@ def main():
             reset_lbl = "🗑️ Xóa context ảnh" if lang == "vi" else "🗑️ Reset image context"
             if st.button(reset_lbl, type="secondary", use_container_width=True, key="btn_reset_img"):
                 st.session_state["_cached_classifications"] = None
-                st.session_state["_cached_plant"]           = ""
-                st.session_state["_cached_disease"]         = ""
-                st.session_state["_cached_image_b64"]       = ""
+                st.session_state["_cached_plant"] = ""
+                st.session_state["_cached_disease"] = ""
+                st.session_state["_cached_image_b64"] = ""
                 st.rerun()
 
         uploaded_file = st.file_uploader(
@@ -1092,9 +1043,9 @@ def main():
         )
         if uploaded_file:
             img = Image.open(uploaded_file)
-            st.image(img, caption="📸 " + ("Ảnh đã chọn" if lang == "vi" else "Selected image"), use_container_width=True)
+            st.image(img, caption="📸 " + ("Ảnh đã chọn" if lang == "vi" else "Selected image"),
+                     use_container_width=True)
             st.session_state["pending_image"] = img
-
             btn_lbl = "🔍 Chẩn đoán ảnh này" if lang == "vi" else "🔍 Diagnose this image"
             if st.button(btn_lbl, type="primary", use_container_width=True, key="btn_diagnose"):
                 q = "Chẩn đoán bệnh cây trong ảnh này" if lang == "vi" else "Diagnose the plant disease in this image"
@@ -1106,12 +1057,14 @@ def main():
                 st.session_state["pending_image"] = None
         st.divider()
 
-        # ── Clear ──
-        clr = "🗑️ Xóa lịch sử chat" if lang == "vi" else "🗑️ Clear chat history"
-        if st.button(clr, use_container_width=True, type="secondary", key="btn_clear"):
-            st.session_state["messages"]               = []
-            st.session_state["pending_image"]          = None
-            st.session_state["_pending_qtype"]         = None
+        # Clear
+        if st.button(
+            "🗑️ Xóa lịch sử chat" if lang == "vi" else "🗑️ Clear chat history",
+            use_container_width=True, type="secondary", key="btn_clear"
+        ):
+            st.session_state["messages"]                = []
+            st.session_state["pending_image"]           = None
+            st.session_state["_pending_qtype"]          = None
             st.session_state["_cached_classifications"] = None
             st.session_state["_cached_plant"]           = ""
             st.session_state["_cached_disease"]         = ""
@@ -1137,18 +1090,19 @@ def main():
                                 <div class="avatar">👤</div>
                             </div>''', unsafe_allow_html=True)
                     else:
-                        card        = m.get("card_html", "")
-                        img_preview = m.get("img_preview_html", "")
+                        card         = m.get("card_html", "")
+                        img_preview  = m.get("img_preview_html", "")
+                        pesticide_html = m.get("pesticide_html", "")
                         st.markdown(f'''
                             <div class="msg-bot">
                                 <div class="avatar">🌿</div>
-                                <div class="bubble" style="white-space:pre-wrap;">{img_preview}{card}{m["content"]}</div>
+                                <div class="bubble" style="white-space:pre-wrap;">{img_preview}{card}{pesticide_html}{m["content"]}</div>
                             </div>''', unsafe_allow_html=True)
                 st.markdown('</div>', unsafe_allow_html=True)
 
         render_all()
 
-        # ── Input row ──
+        # Input row
         lang     = get_lang()
         quick_q  = st.session_state.pop("_quick_q", None)
         qtype    = st.session_state.pop("_pending_qtype", None)
@@ -1158,7 +1112,7 @@ def main():
             st.session_state["_input_submitted"] = True
 
         ic = st.columns([5, 1])
-        ph = "Hỏi về bệnh cây, canh tác..." if lang == "vi" else "Ask about plant diseases, farming..."
+        ph = "Hỏi về bệnh cây, thuốc điều trị, canh tác..." if lang == "vi" else "Ask about diseases, pesticides, farming..."
         with ic[0]:
             user_input = st.text_input("Input", placeholder=ph, label_visibility="collapsed",
                                        key=inp_key, on_change=_on_change)
@@ -1166,7 +1120,6 @@ def main():
             send_clicked = st.button("Gửi →" if lang == "vi" else "Send →",
                                      type="primary", use_container_width=True, key="btn_send")
 
-        # ── Resolve final input ──
         final = None
         if quick_q:
             final = quick_q
@@ -1176,49 +1129,43 @@ def main():
             final = user_input.strip()
             st.session_state["_input_submitted"] = False
 
-        # ── Process ──
         if final:
             has_fresh_img  = st.session_state.get("pending_image") is not None
-            has_cached_img = (
-                st.session_state.get("_cached_classifications") is not None
-                and qtype is not None
-            )
+            has_cached_img = st.session_state.get("_cached_classifications") is not None and qtype is not None
             has_img = has_fresh_img or has_cached_img
 
             st.session_state["messages"].append({
-                "role": "user",
-                "content": final,
-                "has_image": has_img
+                "role": "user", "content": final, "has_image": has_img
             })
 
             pending = st.session_state.get("pending_image")
-            card_html, img_preview_html, resp_text = process_query(
-                final,
-                uploaded_image=pending,
-                qtype=qtype
+            card_html, img_preview_html, pesticide_html, resp_text = process_query(
+                final, uploaded_image=pending, qtype=qtype
             )
 
             st.session_state["messages"].append({
                 "role": "bot",
                 "content": resp_text,
                 "card_html": card_html,
-                "img_preview_html": img_preview_html
+                "img_preview_html": img_preview_html,
+                "pesticide_html": pesticide_html,
             })
 
-            # Reset pending — KHÔNG clear cached
             st.session_state["pending_image"]    = None
             st.session_state["_pending_qtype"]   = None
             st.session_state["_input_submitted"] = False
             st.session_state["input_counter"]   += 1
             st.rerun()
 
-        # ── Hint ──
         hint = (
-            "💡 Bạn có thể gửi ảnh lá cây từ sidebar bên trái để chẩn đoán bệnh"
+            "💡 Gửi ảnh lá cây → chẩn đoán tự động + gợi ý thuốc điều trị từ PPID"
             if lang == "vi" else
-            "💡 You can upload a leaf image from the sidebar for disease diagnosis"
+            "💡 Upload a leaf image → auto diagnosis + pesticide recommendations from PPID"
         )
-        st.markdown(f'<p style="text-align:center;color:#9E9E9E;font-size:12px;margin-top:8px;">{hint}</p>', unsafe_allow_html=True)
+        st.markdown(
+            f'<p style="text-align:center;color:#9E9E9E;font-size:12px;margin-top:8px;">{hint}</p>',
+            unsafe_allow_html=True
+        )
 
 
 if __name__ == "__main__":

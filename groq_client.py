@@ -1,7 +1,12 @@
 """
 groq_client.py — Tích hợp Groq API cho LLM responses.
-Nhận context từ retrieval + image classification,
+Nhận context từ retrieval + image classification + PPID pesticide data,
 rồi gửi lên Groq để tạo response chính xác + hữu ích.
+
+=== UPDATES ===
+- Tích hợp PesticideEngine: tự động inject context thuốc điều trị
+  vào mỗi request liên quan đến bệnh cây (khi image_classifications có disease).
+- Groq nhận context đầy đủ: ảnh + retrieval + gợi ý thuốc từ PPID.
 
 Fix: Groq SDK không có parameter 'system' trong .create().
      System prompt phải đặt vào messages list với role="system".
@@ -25,7 +30,24 @@ class GroqClient:
                 "2. Copy key vào file .env: GROQ_API_KEY=gsk_xxxx"
             )
         self.client = Groq(api_key=GROQ_API_KEY)
+
+        # ── Lazy-load PesticideEngine ──
+        self._pesticide_engine = None
         print("[GROQ] Client initialized.")
+
+    # ──────────────────────────────────────
+    # Lazy-load pesticide engine
+    # ──────────────────────────────────────
+    def _get_pesticide_engine(self):
+        if self._pesticide_engine is None:
+            try:
+                from pesticide_engine import PesticideEngine
+                self._pesticide_engine = PesticideEngine()
+                print("[GROQ] ✅ PesticideEngine loaded.")
+            except Exception as e:
+                print(f"[GROQ] ⚠️ PesticideEngine failed to load: {e}")
+                self._pesticide_engine = False  # Mark as failed
+        return self._pesticide_engine if self._pesticide_engine else None
 
     # ──────────────────────────────────────
     # Build context from retrieval results
@@ -76,6 +98,37 @@ class GroqClient:
         return header + "\n".join(items)
 
     # ──────────────────────────────────────
+    # Build pesticide treatment context
+    # ──────────────────────────────────────
+    def _build_pesticide_context(
+        self,
+        disease: str,
+        plant: str,
+        lang: str
+    ) -> str:
+        """
+        Tra cứu thuốc điều trị từ PesticideEngine + format thành context.
+        Trả về chuỗi rỗng nếu engine không available hoặc cây khỏe.
+        """
+        engine = self._get_pesticide_engine()
+        if not engine:
+            return ""
+
+        try:
+            rec = engine.get_treatment_recommendations(
+                disease=disease,
+                plant=plant,
+                lang=lang,
+                top_products=5
+            )
+            if rec["is_healthy"]:
+                return ""  # Không cần gợi ý thuốc cho cây khỏe
+            return engine.format_for_groq(rec, lang)
+        except Exception as e:
+            print(f"[GROQ] ⚠️ Pesticide lookup error: {e}")
+            return ""
+
+    # ──────────────────────────────────────
     # Main chat method
     # ──────────────────────────────────────
     def chat(
@@ -92,7 +145,7 @@ class GroqClient:
         user_message đã được main.py enrichen với:
         - instruction nghiệp vụ (từ QTYPE_NGHIEP_VU mapping)
         - context ảnh (plant/disease)
-        → Ở đây chỉ cần append retrieval context + image context vào.
+        → Ở đây chỉ cần append retrieval context + image context + pesticide context vào.
         """
         system_prompt = get_system_prompt(lang)
 
@@ -105,13 +158,42 @@ class GroqClient:
         if retrieval_results:
             context_parts.append(self._build_retrieval_context(retrieval_results, lang))
 
+        # ── Add pesticide context when disease detected ──
+        if image_classifications:
+            top = image_classifications[0]
+            detected_disease = top.get("disease", "")
+            detected_plant   = top.get("plant", "")
+            is_healthy       = "healthy" in detected_disease.lower()
+
+            # Only add pesticide recommendations if disease detected (not healthy)
+            if not is_healthy and detected_disease:
+                pesticide_ctx = self._build_pesticide_context(
+                    disease=detected_disease,
+                    plant=detected_plant,
+                    lang=lang
+                )
+                if pesticide_ctx:
+                    context_parts.append(pesticide_ctx)
+
         # Combine context + user_message (đã có instruction từ main.py)
         if context_parts:
             enriched_message = "\n\n".join(context_parts) + "\n\n"
             if lang == "vi":
-                enriched_message += f"💬 **Yêu cầu của bạn:** {user_message}\n\nDựa trên thông tin trên, hãy trả lời chi tiết và hữu ích theo yêu cầu đã nêu."
+                enriched_message += (
+                    f"💬 **Yêu cầu của bạn:** {user_message}\n\n"
+                    "Dựa trên thông tin trên (kết quả chẩn đoán ảnh, tài liệu tham chiếu, "
+                    "và gợi ý thuốc điều trị từ cơ sở dữ liệu thuốc bảo vệ thực vật), "
+                    "hãy trả lời chi tiết và hữu ích. "
+                    "Nếu có thông tin về thuốc điều trị, hãy tổng hợp và đưa ra khuyến nghị thực hành cụ thể."
+                )
             else:
-                enriched_message += f"💬 **Your request:** {user_message}\n\nBased on the above information, provide a detailed and helpful response as specified."
+                enriched_message += (
+                    f"💬 **Your request:** {user_message}\n\n"
+                    "Based on the above information (image diagnosis, reference documents, "
+                    "and pesticide treatment suggestions from the PPID database), "
+                    "provide a detailed and helpful response. "
+                    "If pesticide information is available, synthesize it into specific practical recommendations."
+                )
         else:
             enriched_message = user_message
 

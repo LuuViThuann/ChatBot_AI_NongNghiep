@@ -1,0 +1,30 @@
+pip install -r requirements.txt
+pip install open_clip_torch
+GROQ_API_KEY=gsk_your_api_key_here
+python setup.py
+python -m streamlit run main.py
+
+* Cụ thể cài đặt:
+
+Bước 1 — Cài dependencies
+->  pip install -r requirements.txt
+Bước 2 — Tạo file .env và thêm API key
+-> GROQ_API_KEY=gsk_xxxxxxxxxxxxxxxxxxxxxxxx
+Bước 3 — Đặt file dữ liệu CSV vào thư mục data/
+-> Các file dataset có đủ
+Bước 4 — Build index (chỉ chạy lần đầu)
+-> python setup.py
+Bước 5 — Chạy ứng dụng
+-> python -m streamlit run main.py
+
+Kiểm tra Dataset thuốc : python pesticide_engine.py
+
+-----------------------
+ 
++ Trường hợp lỗi : Kiểm tra Torch trong nguồn máy
+
+===============
+
++ Nguồn Dataset : https://huggingface.co/datasets/SyedNazmusSakib/PlantVillageVQA?utm_source=chatgpt.com
+
++ Nguồn thuốc : https://open.canada.ca/data/en/dataset/e10b0d6e-04ac-4014-a64a-666c3874bbe0?utm_source=chatgpt.com
